@@ -352,7 +352,6 @@ async function processAndDownloadPlaylist(playlistData) {
      if (filesToProcess.length > 0) {
          const downloadFile = async (file, index) => {
              console.log(`[DOWNLOADING] ${file.filename} from ${file.remoteUrl}`);
-             if (mainWindow) mainWindow.webContents.send('download-progress', { show: true, text: `Downloading ${index + 1} / ${filesToProcess.length}...`});
 
              try {
                  const response = await axios({ method: 'GET', url: file.remoteUrl, responseType: 'stream' });
@@ -387,7 +386,7 @@ async function processAndDownloadPlaylist(playlistData) {
              if (!initialPlaybackTriggered && fs.existsSync(finalLocalPathsArray[0].replace('file:///', ''))) {
                  console.log("First essential video is cached! Starting initial playback instantly.");
                  if (mainWindow) {
-                     mainWindow.webContents.send('download-progress', { show: false });
+                     // download-progress overlay removed
                      mainWindow.webContents.send('update-playlist', [finalLocalPathsArray[0]]);
                  }
                  initialPlaybackTriggered = true;
@@ -396,7 +395,7 @@ async function processAndDownloadPlaylist(playlistData) {
 
          if (mainWindow && !initialPlaybackTriggered) {
              // Fallback just in case
-             mainWindow.webContents.send('download-progress', { show: false });
+             // download-progress overlay removed
          }
 
          if (allSuccessful && mainWindow) {
@@ -406,7 +405,7 @@ async function processAndDownloadPlaylist(playlistData) {
      } else {
          // All files are already cached, push instantly
          if (mainWindow) {
-             mainWindow.webContents.send('download-progress', { show: false });
+             // download-progress overlay removed
              mainWindow.webContents.send('update-playlist', finalLocalPathsArray);
          }
      }
