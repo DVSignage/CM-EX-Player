@@ -1,4 +1,31 @@
+# Dependencies — never commit these
 node_modules/
+
+# Electron-builder output directories
 dist/
+out/
 build/
-*.node
+release/
+
+# Compiled installer files
+*.exe
+*.msi
+*.dmg
+*.AppImage
+*.deb
+*.rpm
+*.zip
+*.tar.gz
+*.nsis
+
+# Electron cache
+.electron/
+electron-builder-cache/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
