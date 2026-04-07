@@ -4,8 +4,12 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
+const WebSocket = require('ws');
 
-module.exports = function setupApi(getMainWindow, CACHE_DIR) {
+// Shared broadcast function — filled in once the server starts
+let _broadcast = () => {};
+
+function setupApi(getMainWindow, CACHE_DIR, getNdiSources, startNdiSend, stopNdiSend, getNdiSender) {
     const apiApp = express();
     apiApp.use(cors());
     apiApp.use(express.json());
@@ -139,6 +143,16 @@ module.exports = function setupApi(getMainWindow, CACHE_DIR) {
         res.json({ status: 'success', message: 'Capture stopped, resuming playlist' });
     });
 
+    // --- NDI Source Discovery ---
+    apiApp.get('/api/ndi/sources', async (req, res) => {
+        try {
+            const sources = getNdiSources ? await getNdiSources() : [];
+            res.json({ sources });
+        } catch (err) {
+            res.json({ sources: [], error: err.message });
+        }
+    });
+
     // --- Existing Playback Control Endpoints ---
 
     apiApp.post('/api/play', (req, res) => {
@@ -214,6 +228,7 @@ module.exports = function setupApi(getMainWindow, CACHE_DIR) {
             cache_limit_bytes: 50 * 1024 * 1024 * 1024,
             capture_supported: true,
             preview_supported: true,
+            ndi_supported: typeof getNdiSources === 'function',
             preview: {
                 stream_url: `http://${ip}:${API_PORT}/api/preview/stream`,
                 snapshot_url: `http://${ip}:${API_PORT}/api/preview/snapshot`,
@@ -226,6 +241,60 @@ module.exports = function setupApi(getMainWindow, CACHE_DIR) {
         });
     });
 
+    // --- NDI Send (Capture → NDI broadcast) ---
+
+    apiApp.post('/api/ndi/send/start', (req, res) => {
+        const sourceName = req.body.sourceName || 'Player-Capture';
+        if (typeof startNdiSend === 'function') {
+            startNdiSend(sourceName);
+            res.json({ status: 'success', sourceName });
+        } else {
+            res.status(501).json({ error: 'NDI send not available' });
+        }
+    });
+
+    apiApp.post('/api/ndi/send/stop', (_req, res) => {
+        if (typeof stopNdiSend === 'function') {
+            stopNdiSend();
+            res.json({ status: 'success', message: 'NDI broadcast stopped' });
+        } else {
+            res.status(501).json({ error: 'NDI send not available' });
+        }
+    });
+
+    apiApp.get('/api/ndi/send/status', (_req, res) => {
+        const sender = typeof getNdiSender === 'function' ? getNdiSender() : null;
+        res.json({
+            active: !!(sender && sender.active),
+            sourceName: sender ? sender.sourceName : null,
+        });
+    });
+
     const API_PORT = 8081;
-    apiApp.listen(API_PORT, () => console.log(`Local API listening on port ${API_PORT}`));
-};
+    const server = apiApp.listen(API_PORT, () => console.log(`Local API listening on port ${API_PORT}`));
+
+    // --- WebSocket server for playback status (same port as HTTP) ---
+    const wss = new WebSocket.Server({ server });
+
+    wss.on('connection', (ws) => {
+        console.log('[WS] Client connected');
+        ws.on('close', () => console.log('[WS] Client disconnected'));
+        ws.on('error', (err) => console.warn('[WS] Error:', err.message));
+    });
+
+    _broadcast = (data) => {
+        const msg = JSON.stringify(data);
+        wss.clients.forEach((client) => {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(msg);
+            }
+        });
+    };
+
+    console.log(`[WS] WebSocket server ready on ws://localhost:${API_PORT}`);
+}
+
+// Attach broadcastStatus AFTER the function declaration so it isn't overwritten
+setupApi.broadcastStatus = (data) => _broadcast(data);
+
+module.exports = setupApi;

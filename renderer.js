@@ -9,10 +9,70 @@ let hiddenPlayer = playerB;
 let currentVideoIndex = 0;
 let captureStream = null;
 let captureActive = false;
-let imageTimer = null;
+let imageTimer = null;  // timer handle when showing a static image
 let currentCrop = null; // video wall crop region { x, y, w, h } normalised 0.0–1.0
 
+// Default duration for images when no duration is specified (ms)
 const IMAGE_DEFAULT_DURATION_MS = 10000;
+
+// --- Template iframe player ---
+const templatePlayer = document.getElementById('templatePlayer');
+let templateTimer = null;
+
+function isTemplatePath(p) { return typeof p === 'string' && p.startsWith('template::'); }
+
+function showTemplate(url) {
+    playerA.pause(); playerB.pause();
+    playerA.style.display = 'none'; playerB.style.display = 'none';
+    if (cropCanvas) cropCanvas.style.display = 'none';
+    stopCropVideoLoop();
+    imagePlayer.style.display = 'none';
+    templatePlayer.src = url;
+    templatePlayer.style.display = 'block';
+}
+
+function hideTemplate() {
+    if (templateTimer) { clearTimeout(templateTimer); templateTimer = null; }
+    templatePlayer.style.display = 'none';
+    templatePlayer.src = '';
+    playerA.style.display = '';
+    playerB.style.display = '';
+}
+
+// --- Playback status broadcaster (feeds WebSocket via IPC) ---
+let _statusInterval = null;
+let _currentFilename = '';
+let _contentStartTime = 0;
+
+function startStatusBroadcast(filename, duration) {
+    _currentFilename = filename;
+    _contentStartTime = Date.now();
+    if (_statusInterval) clearInterval(_statusInterval);
+    _statusInterval = setInterval(() => {
+        if (!window.playerAPI || !window.playerAPI.sendPlaybackStatus) return;
+        const elapsed = (Date.now() - _contentStartTime) / 1000;
+        // For video get actual currentTime; fallback to elapsed for images/templates
+        let position = elapsed;
+        let videoDuration = duration || 0;
+        try {
+            if (!activePlayer.paused && activePlayer.readyState >= 2) {
+                position = activePlayer.currentTime;
+                if (activePlayer.duration && !isNaN(activePlayer.duration)) {
+                    videoDuration = activePlayer.duration;
+                }
+            }
+        } catch (e) {}
+        window.playerAPI.sendPlaybackStatus({
+            type: 'playback',
+            filename: _currentFilename,
+            position: Math.round(position * 10) / 10,
+            duration: Math.round(videoDuration * 10) / 10,
+            playlist_index: currentVideoIndex,
+            playlist_length: playlist.length,
+            timestamp: Date.now(),
+        });
+    }, 500);
+}
 
 // --- Video wall crop canvas ---
 const cropCanvas = document.getElementById('cropCanvas');
@@ -24,8 +84,11 @@ function isImagePath(path) {
 }
 
 function showImage(path) {
-    playerA.pause(); playerB.pause();
-    playerA.style.display = 'none'; playerB.style.display = 'none';
+    // Stop video players
+    playerA.pause();
+    playerB.pause();
+    playerA.style.display = 'none';
+    playerB.style.display = 'none';
     stopCropVideoLoop();
 
     if (currentCrop && cropCanvas && cropCtx) {
@@ -58,11 +121,22 @@ function hideImage() {
     imagePlayer.src = '';
     if (cropCanvas) cropCanvas.style.display = 'none';
     stopCropVideoLoop();
-    playerA.style.display = ''; playerB.style.display = '';
+    playerA.style.display = '';
+    playerB.style.display = '';
 }
+
+// NDI state
+const ndiCanvas = document.getElementById('ndiCanvas');
+const ndiCtx = ndiCanvas ? ndiCanvas.getContext('2d') : null;
+const noSignalOverlay = document.getElementById('noSignalOverlay');
+const noSignalSource = document.getElementById('noSignalSource');
+let ndiActive = false;
+let ndiNoSignalTimer = null;
+const NDI_NO_SIGNAL_DELAY_MS = 20000; // Hold last frame for 20s before showing "No Signal"
 
 // Empty playlist. Player will wait for CMS push.
 const playlist = [];
+const durations = [];  // parallel array: durations[i] matches playlist[i]
 
 function updateDebug(msg) {
     const videoName = playlist[currentVideoIndex] ? playlist[currentVideoIndex].split('/').pop() : 'None';
@@ -72,19 +146,37 @@ function updateDebug(msg) {
 function initializePlayer() {
     if (playlist.length === 0) return;
 
-    if (isImagePath(playlist[0])) {
-        hideImage();
-        showImage(playlist[0]);
+    const currentPath = playlist[0];
+    const currentDur = durations[0] || 0;
+
+    if (isTemplatePath(currentPath)) {
+        hideImage(); hideTemplate();
+        const url = currentPath.replace('template::', '');
+        showTemplate(url);
+        updateDebug('Template...');
+        const dur = currentDur > 0 ? currentDur * 1000 : IMAGE_DEFAULT_DURATION_MS;
+        templateTimer = setTimeout(() => handleVideoEnd(), dur);
+        startStatusBroadcast(url.split('/').pop() || 'Template', currentDur || IMAGE_DEFAULT_DURATION_MS / 1000);
+    } else if (isImagePath(currentPath)) {
+        // Show image, advance after duration
+        hideImage(); hideTemplate();
+        showImage(currentPath);
         updateDebug('Showing image...');
-        imageTimer = setTimeout(() => handleVideoEnd(), IMAGE_DEFAULT_DURATION_MS);
+        const dur = currentDur > 0 ? currentDur * 1000 : IMAGE_DEFAULT_DURATION_MS;
+        imageTimer = setTimeout(() => handleVideoEnd(), dur);
+        startStatusBroadcast(currentPath.split('/').pop() || 'Image', currentDur || IMAGE_DEFAULT_DURATION_MS / 1000);
     } else {
-        hideImage();
-        activePlayer.src = playlist[0];
+        // Video: hide image player, show video players
+        hideImage(); hideTemplate();
+        activePlayer.src = currentPath;
         activePlayer.play().catch(e => console.error(e));
         if (currentCrop) startCropVideoLoop(activePlayer);
         updateDebug('Playing...');
+        startStatusBroadcast(currentPath.split('/').pop() || 'Video', currentDur);
+
+        // Preload second item if it's a video
         const nextPath = playlist.length > 1 ? playlist[1] : playlist[0];
-        if (!isImagePath(nextPath)) {
+        if (!isImagePath(nextPath) && !isTemplatePath(nextPath)) {
             hiddenPlayer.src = nextPath;
             hiddenPlayer.load();
         }
@@ -95,32 +187,62 @@ function handleVideoEnd() {
     updateDebug('Switching...');
 
     if (playlist.length <= 1) {
+        // Single item — loop it
         currentVideoIndex = 0;
-        initializePlayer();
+        if (isTemplatePath(playlist[0])) {
+            // Template: don't reload the iframe, just reset the advance timer
+            // to avoid a blank flash while the iframe tears down and reloads
+            const dur = (durations[0] || 0) > 0 ? durations[0] * 1000 : IMAGE_DEFAULT_DURATION_MS;
+            if (templateTimer) clearTimeout(templateTimer);
+            templateTimer = setTimeout(() => handleVideoEnd(), dur);
+        } else {
+            initializePlayer();
+        }
         return;
     }
 
     const nextVideoIndex = (currentVideoIndex + 1) % playlist.length;
     currentVideoIndex = nextVideoIndex;
     const nextPath = playlist[nextVideoIndex];
+    const nextDur = durations[nextVideoIndex] || 0;
 
-    if (isImagePath(nextPath)) {
+    if (isTemplatePath(nextPath)) {
         activePlayer.classList.remove('active');
         activePlayer.classList.add('hidden');
-        hideImage();
-        showImage(nextPath);
-        updateDebug('Showing image...');
-        imageTimer = setTimeout(() => handleVideoEnd(), IMAGE_DEFAULT_DURATION_MS);
+        hideImage(); hideTemplate();
+        const url = nextPath.replace('template::', '');
+        showTemplate(url);
+        updateDebug('Template...');
+        const dur = nextDur > 0 ? nextDur * 1000 : IMAGE_DEFAULT_DURATION_MS;
+        templateTimer = setTimeout(() => handleVideoEnd(), dur);
+        startStatusBroadcast(url.split('/').pop() || 'Template', nextDur || IMAGE_DEFAULT_DURATION_MS / 1000);
         return;
     }
 
-    hideImage();
+    if (isImagePath(nextPath)) {
+        // Next item is an image — hide video players, show image
+        activePlayer.classList.remove('active');
+        activePlayer.classList.add('hidden');
+        hideImage(); hideTemplate();
+        showImage(nextPath);
+        updateDebug('Showing image...');
+        const dur = nextDur > 0 ? nextDur * 1000 : IMAGE_DEFAULT_DURATION_MS;
+        imageTimer = setTimeout(() => handleVideoEnd(), dur);
+        startStatusBroadcast(nextPath.split('/').pop() || 'Image', nextDur || IMAGE_DEFAULT_DURATION_MS / 1000);
+        return;
+    }
+
+    // Next item is a video
+    hideImage(); hideTemplate();
     const preloadVideoIndex = (nextVideoIndex + 1) % playlist.length;
 
+    // Swap active/hidden CSS classes
     activePlayer.classList.remove('active');
     activePlayer.classList.add('hidden');
+
     hiddenPlayer.classList.remove('hidden');
     hiddenPlayer.classList.add('active');
+
     hiddenPlayer.play().catch(e => console.error(e));
 
     const temp = activePlayer;
@@ -129,12 +251,14 @@ function handleVideoEnd() {
 
     if (currentCrop) startCropVideoLoop(activePlayer);
 
+    // Preload next item if it's a video
     const preloadPath = playlist[preloadVideoIndex];
-    if (!isImagePath(preloadPath)) {
+    if (!isImagePath(preloadPath) && !isTemplatePath(preloadPath)) {
         hiddenPlayer.src = preloadPath;
         hiddenPlayer.load();
     }
 
+    startStatusBroadcast(nextPath.split('/').pop() || 'Video', nextDur);
     updateDebug('Playing...');
 }
 
@@ -271,6 +395,103 @@ function stopCapture() {
     }
 }
 
+// --- NDI Send (Capture → NDI broadcast) ---
+let ndiSendActive = false;
+let ndiSendRAF = null;
+const ndiSendCanvas = document.createElement('canvas');
+const ndiSendCtx = ndiSendCanvas.getContext('2d');
+const NDI_SEND_FPS = 30;
+let ndiSendLastFrameTime = 0;
+
+function ndiSendFrameLoop(timestamp) {
+    if (!ndiSendActive || !captureActive || !capturePlayer.srcObject) {
+        ndiSendRAF = null;
+        return;
+    }
+    const elapsed = timestamp - ndiSendLastFrameTime;
+    if (elapsed >= 1000 / NDI_SEND_FPS) {
+        ndiSendLastFrameTime = timestamp;
+        const vw = capturePlayer.videoWidth;
+        const vh = capturePlayer.videoHeight;
+        if (vw > 0 && vh > 0) {
+            if (ndiSendCanvas.width !== vw || ndiSendCanvas.height !== vh) {
+                ndiSendCanvas.width = vw;
+                ndiSendCanvas.height = vh;
+            }
+            ndiSendCtx.drawImage(capturePlayer, 0, 0, vw, vh);
+            const imageData = ndiSendCtx.getImageData(0, 0, vw, vh);
+            const rgba = imageData.data;
+            // RGBA → BGRA swap
+            for (let i = 0; i < rgba.length; i += 4) {
+                const r = rgba[i];
+                rgba[i] = rgba[i + 2];     // B
+                rgba[i + 2] = r;           // R
+            }
+            if (window.playerAPI && window.playerAPI.sendNdiFrame) {
+                window.playerAPI.sendNdiFrame({
+                    data: rgba.buffer,
+                    width: vw,
+                    height: vh,
+                });
+            }
+        }
+    }
+    ndiSendRAF = requestAnimationFrame(ndiSendFrameLoop);
+}
+
+if (window.playerAPI) {
+    window.playerAPI.onNdiSendStarted(({ sourceName }) => {
+        console.log('[NDI SEND] Started broadcasting as:', sourceName);
+        ndiSendActive = true;
+        if (!ndiSendRAF) ndiSendRAF = requestAnimationFrame(ndiSendFrameLoop);
+    });
+    window.playerAPI.onNdiSendStopped(() => {
+        console.log('[NDI SEND] Stopped broadcasting');
+        ndiSendActive = false;
+        if (ndiSendRAF) { cancelAnimationFrame(ndiSendRAF); ndiSendRAF = null; }
+    });
+}
+
+// --- NDI Canvas Functions ---
+
+function showNdiCanvas() {
+  ndiCanvas.style.display = 'block';
+  noSignalOverlay.style.display = 'none';
+  // Hide playlist players
+  playerA.style.display = 'none'; playerA.pause();
+  playerB.style.display = 'none'; playerB.pause();
+  capturePlayer.style.display = 'none';
+  ndiActive = true;
+  if (_statusInterval) { clearInterval(_statusInterval); _statusInterval = null; }
+  updateDebug('NDI Live');
+}
+
+function hideNdiCanvas() {
+  ndiCanvas.style.display = 'none';
+  noSignalOverlay.style.display = 'none';
+  ndiActive = false;
+  if (ndiNoSignalTimer) { clearTimeout(ndiNoSignalTimer); ndiNoSignalTimer = null; }
+  // Restore playlist players
+  playerA.style.display = '';
+  playerB.style.display = '';
+  activePlayer.classList.remove('hidden');
+  activePlayer.classList.add('active');
+  if (playlist.length > 0) {
+    activePlayer.play().catch(e => console.error(e));
+  }
+  updateDebug('NDI stopped — resuming playlist');
+}
+
+function showNoSignal(sourceName) {
+  playerA.style.display = 'none'; playerA.pause();
+  playerB.style.display = 'none'; playerB.pause();
+  capturePlayer.style.display = 'none';
+  ndiCanvas.style.display = 'none';
+  noSignalOverlay.style.display = 'flex';
+  if (noSignalSource) noSignalSource.textContent = sourceName || '';
+  updateDebug('NDI: No Signal — ' + (sourceName || ''));
+}
+
 // --- Video wall crop: video loop ---
 function startCropVideoLoop(videoEl) {
     stopCropVideoLoop();
@@ -376,15 +597,19 @@ if (window.playerAPI) {
         updateDebug('Registration Approved. Waiting for playlist...');
     });
 
-    window.playerAPI.onUpdatePlaylist((newPlaylistPaths) => {
+    window.playerAPI.onUpdatePlaylist((newPlaylistPaths, newDurations) => {
         console.log("Received new local playlist.");
         if (!newPlaylistPaths || newPlaylistPaths.length === 0) return;
+
+        // If NDI is active, stop it so playlist takes over
+        if (ndiActive) hideNdiCanvas();
 
         // If capture is active, stop it first so playlist takes over
         if (captureActive) stopCapture();
 
-        // Stop image timer if showing a static image
+        // Stop image/template timers
         hideImage();
+        hideTemplate();
 
         // Stop current video playback
         activePlayer.pause();
@@ -399,12 +624,14 @@ if (window.playerAPI) {
         // Update our playlist array with the local file paths from main.js
         playlist.length = 0;
         playlist.push(...newPlaylistPaths);
+        durations.length = 0;
+        durations.push(...(newDurations || []));
 
         currentVideoIndex = 0;
         initializePlayer();
     });
 
-    window.playerAPI.onAppendPlaylist((newPlaylistPaths) => {
+    window.playerAPI.onAppendPlaylist((newPlaylistPaths, newDurations) => {
         console.log("Background downloads complete. Appending local playlist.");
         if (!newPlaylistPaths || newPlaylistPaths.length === 0) return;
 
@@ -412,6 +639,8 @@ if (window.playerAPI) {
         // without interrupting the currently playing active video!
         playlist.length = 0;
         playlist.push(...newPlaylistPaths);
+        durations.length = 0;
+        durations.push(...(newDurations || []));
 
         // Ensure hidden player has the next video preloaded correctly
         if (playlist.length > 1) {
@@ -453,6 +682,125 @@ if (window.playerAPI) {
 
     window.playerAPI.onStopCapture(() => {
         stopCapture();
+    });
+
+    // --- NDI Listeners ---
+    // --- NDI Canvas Self-Test (press T to draw test pattern) ---
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 't' || e.key === 'T') {
+            console.log('[NDI TEST] Drawing canvas test pattern...');
+            showNdiCanvas();
+            const w = 1280, h = 720;
+            ndiCanvas.width = w;
+            ndiCanvas.height = h;
+            // Draw colour bars
+            const barW = Math.floor(w / 7);
+            const colours = ['#fff','#ff0','#0ff','#0f0','#f0f','#f00','#00f'];
+            colours.forEach((c, i) => {
+                ndiCtx.fillStyle = c;
+                ndiCtx.fillRect(i * barW, 0, barW, h);
+            });
+            ndiCtx.fillStyle = 'white';
+            ndiCtx.font = '48px monospace';
+            ndiCtx.fillText('NDI CANVAS OK — waiting for stream...', 60, h / 2);
+            console.log('[NDI TEST] Test pattern drawn — if you see colour bars, canvas is working');
+        }
+    });
+
+    // Offscreen canvas for NDI crop (created on demand)
+    let ndiOffscreen = null;
+    let ndiOffCtx = null;
+
+    window.playerAPI.onNdiFrame(({ data, width, height, sourceName }) => {
+        if (!ndiActive) {
+            console.log(`[NDI RENDERER] First frame received — ${width}x${height}${currentCrop ? ' (cropped)' : ''} — showing canvas`);
+            showNdiCanvas();
+        }
+        if (!ndiCtx) { console.error('[NDI RENDERER] ndiCtx is null!'); return; }
+
+        // Frame arrived — cancel any pending no-signal timer
+        if (ndiNoSignalTimer) {
+            clearTimeout(ndiNoSignalTimer);
+            ndiNoSignalTimer = null;
+        }
+        // Hide no-signal if it was showing
+        if (noSignalOverlay.style.display !== 'none') {
+            noSignalOverlay.style.display = 'none';
+            ndiCanvas.style.display = 'block';
+        }
+
+        try {
+            // BGRA → RGBA conversion
+            const src = new Uint8ClampedArray(data instanceof ArrayBuffer ? data : data.buffer || data);
+            const expectedLen = width * height * 4;
+            if (src.length !== expectedLen) {
+                console.error(`[NDI RENDERER] Buffer size mismatch — expected ${expectedLen}, got ${src.length}`);
+                return;
+            }
+
+            if (currentCrop) {
+                // --- Cropped NDI mode: draw full frame to offscreen, then crop to visible canvas ---
+                if (!ndiOffscreen || ndiOffscreen.width !== width || ndiOffscreen.height !== height) {
+                    ndiOffscreen = document.createElement('canvas');
+                    ndiOffscreen.width = width;
+                    ndiOffscreen.height = height;
+                    ndiOffCtx = ndiOffscreen.getContext('2d');
+                }
+                const imageData = ndiOffCtx.createImageData(width, height);
+                const dst = imageData.data;
+                for (let i = 0; i < src.length; i += 4) {
+                    dst[i]     = src[i + 2]; // R ← B
+                    dst[i + 1] = src[i + 1]; // G
+                    dst[i + 2] = src[i];     // B ← R
+                    dst[i + 3] = 255;
+                }
+                ndiOffCtx.putImageData(imageData, 0, 0);
+
+                // Crop region in source pixels
+                const sx = Math.round(currentCrop.x * width);
+                const sy = Math.round(currentCrop.y * height);
+                const sw = Math.round(currentCrop.w * width);
+                const sh = Math.round(currentCrop.h * height);
+
+                // Size visible canvas to fill screen
+                ndiCanvas.width = window.innerWidth;
+                ndiCanvas.height = window.innerHeight;
+                ndiCtx.drawImage(ndiOffscreen, sx, sy, sw, sh, 0, 0, ndiCanvas.width, ndiCanvas.height);
+            } else {
+                // --- Full-frame NDI mode (no crop) ---
+                if (ndiCanvas.width !== width || ndiCanvas.height !== height) {
+                    ndiCanvas.width = width;
+                    ndiCanvas.height = height;
+                }
+                const imageData = ndiCtx.createImageData(width, height);
+                const dst = imageData.data;
+                for (let i = 0; i < src.length; i += 4) {
+                    dst[i]     = src[i + 2]; // R ← B
+                    dst[i + 1] = src[i + 1]; // G
+                    dst[i + 2] = src[i];     // B ← R
+                    dst[i + 3] = 255;
+                }
+                ndiCtx.putImageData(imageData, 0, 0);
+            }
+        } catch (e) {
+            console.error('[NDI] Frame draw error:', e);
+        }
+    });
+
+    window.playerAPI.onNdiNoSignal(({ sourceName }) => {
+        // Debounce: hold last frame for 20 seconds before showing "No Signal"
+        // Brief frame drops are normal with NDI — don't flash the overlay
+        if (!ndiNoSignalTimer) {
+            console.log(`[NDI] Signal drop detected — holding last frame for ${NDI_NO_SIGNAL_DELAY_MS / 1000}s before showing No Signal`);
+            ndiNoSignalTimer = setTimeout(() => {
+                ndiNoSignalTimer = null;
+                showNoSignal(sourceName);
+            }, NDI_NO_SIGNAL_DELAY_MS);
+        }
+    });
+
+    window.playerAPI.onStopNdi(() => {
+        hideNdiCanvas();
     });
 
     // --- Video wall crop listener ---
