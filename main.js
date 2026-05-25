@@ -539,6 +539,7 @@ function createWindow() {
         alwaysOnTop: true,
         kiosk: true,
         autoHideMenuBar: true,
+        icon: path.join(__dirname, 'app.ico'),
         webPreferences: {
             preload: path.join(__dirname, 'preload.js'),
             nodeIntegration: false,
