@@ -6,6 +6,8 @@ const axios = require('axios');
 const fs = require('fs');
 const os = require('os');
 
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+
 let mainWindow;
 
 // --- CONFIGURATION ---
@@ -374,7 +376,7 @@ async function processAndDownloadPlaylist(playlistData) {
 
      // Progressive Initial Playback Structure
      if (mainWindow && filesToProcess.length > 0) {
-         // Aggressively clear old playlist so user immediately sees a change happened when downloading
+         global.last_sent_playlist_key = null; // playlist is changing, allow next cached send through
          mainWindow.webContents.send('update-playlist', []);
      }
 
@@ -433,9 +435,14 @@ async function processAndDownloadPlaylist(playlistData) {
              mainWindow.webContents.send('append-playlist', finalLocalPathsArray);
          }
      } else {
-         // All files are already cached, push instantly
+         // All files are already cached — skip if playlist is identical to what's already playing
+         const playlistKey = finalLocalPathsArray.join('|');
+         if (playlistKey === global.last_sent_playlist_key) {
+             console.log("[PLAYLIST] Unchanged, skipping redundant update.");
+             return;
+         }
+         global.last_sent_playlist_key = playlistKey;
          if (mainWindow) {
-             // download-progress overlay removed
              mainWindow.webContents.send('update-playlist', finalLocalPathsArray);
          }
      }

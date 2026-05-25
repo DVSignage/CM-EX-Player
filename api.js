@@ -231,14 +231,13 @@ module.exports = function setupApi(getMainWindow, CACHE_DIR) {
     server.on('error', (err) => {
         if (err.code === 'EADDRINUSE') {
             const { dialog, app } = require('electron');
-            dialog.showMessageBoxSync({
-                type: 'error',
+            dialog.showMessageBox({
+                type: 'warning',
                 title: 'Port Already In Use',
-                message: `CMX Player cannot start because port ${API_PORT} is already in use.`,
-                detail: 'Another instance of CMX Player may already be running.\n\nClose it and try again, or check Task Manager for a lingering process.',
+                message: `Local API (port ${API_PORT}) is unavailable.`,
+                detail: 'Another instance of CMX Player may already be running. Third-party API control will not work, but the player will continue normally.',
                 buttons: ['OK']
             });
-            app.quit();
         } else {
             console.error('API server error:', err);
         }
