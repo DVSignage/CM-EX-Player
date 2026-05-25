@@ -37,9 +37,6 @@ function saveConfig() {
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
 }
 
-// --- EXPRESS SERVER FOR 3RD PARTY APIs ---
-require('./api')(() => mainWindow, CACHE_DIR);
-
 // --- CMS INTEGRATION LOGIC ---
 
 let enrollmentPollingInterval = null;
@@ -187,6 +184,10 @@ async function sendHeartbeat() {
                 if (mainWindow) mainWindow.webContents.send('stop-capture');
             } else if (['play', 'pause', 'next', 'previous', 'restart'].includes(cmd)) {
                 if (mainWindow) mainWindow.webContents.send('control-command', cmd);
+            } else if (cmd === 'refresh') {
+                handleRefreshCommand();
+            } else if (cmd === 'restart_service') {
+                handleRestartCommand();
             }
         }
 
@@ -246,6 +247,35 @@ function handleCMSCommand(data) {
              mainWindow.webContents.send('prompt-cms-url', config.cms_url);
         }
     }
+}
+
+let refreshInProgress = false;
+
+function handleRefreshCommand() {
+    if (refreshInProgress || !mainWindow) return;
+    refreshInProgress = true;
+    console.log('[CMD] Refresh: reloading renderer...');
+
+    mainWindow.webContents.reload();
+
+    mainWindow.webContents.once('did-finish-load', async () => {
+        refreshInProgress = false;
+        try {
+            await axios.post(`${config.cms_url}/api/v1/players/${config.player_id}/ack`, {
+                success: true,
+                message: 'Refresh completed'
+            });
+            console.log('[CMD] Refresh ACK sent.');
+        } catch (e) {
+            console.error('[CMD] Refresh ACK failed:', e.message);
+        }
+    });
+}
+
+function handleRestartCommand() {
+    console.log('[CMD] Restart: relaunching app...');
+    app.relaunch();
+    app.exit(0);
 }
 
 async function fetchPlaylist() {
@@ -484,6 +514,8 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+    require('./api')(() => mainWindow, CACHE_DIR);
+
     ipcMain.on('submit-cms-url', (event, url) => {
         config.cms_url = url;
         saveConfig();
