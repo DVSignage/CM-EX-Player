@@ -15,5 +15,7 @@ contextBridge.exposeInMainWorld('playerAPI', {
     onStartCapture: (callback) => ipcRenderer.on('start-capture', (_event, config) => callback(config)),
     onStopCapture: (callback) => ipcRenderer.on('stop-capture', () => callback()),
     // Video wall crop support
-    onSetCrop: (callback) => ipcRenderer.on('set-crop', (_event, crop) => callback(crop))
+    onSetCrop: (callback) => ipcRenderer.on('set-crop', (_event, crop) => callback(crop)),
+    // Volume control
+    onSetVolume: (callback) => ipcRenderer.on('set-volume', (_event, state) => callback(state))
 });

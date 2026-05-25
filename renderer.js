@@ -19,6 +19,14 @@ const cropCanvas = document.getElementById('cropCanvas');
 const cropCtx = cropCanvas ? cropCanvas.getContext('2d') : null;
 let cropVideoRAF = null; // requestAnimationFrame handle for video crop loop
 
+function applyVolumeToPlayers(volume, muted) {
+    const level = volume / 100;
+    playerA.volume = level;
+    playerB.volume = level;
+    playerA.muted = muted;
+    playerB.muted = muted;
+}
+
 function isImagePath(path) {
     return /\.(png|jpe?g|gif|webp|bmp|svg)(\?.*)?$/i.test(path);
 }
@@ -453,6 +461,12 @@ if (window.playerAPI) {
 
     window.playerAPI.onStopCapture(() => {
         stopCapture();
+    });
+
+    // --- Volume control ---
+    window.playerAPI.onSetVolume(({ volume, muted }) => {
+        applyVolumeToPlayers(volume, muted);
+        console.log(`[VOLUME] volume=${volume} muted=${muted}`);
     });
 
     // --- Video wall crop listener ---

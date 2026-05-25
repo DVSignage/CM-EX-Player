@@ -22,7 +22,9 @@ if (!fs.existsSync(CACHE_DIR)) {
 
 let config = {
     cms_url: '',
-    player_id: null
+    player_id: null,
+    volume: 100,
+    muted: false
 };
 
 // Load config if exists
@@ -111,7 +113,10 @@ function startPlayerRoutines() {
     // 2. Fetch latest from CMS in background — updates playlist if anything changed
     fetchPlaylist();
 
-    // 3. Start Heartbeat (every 500 milliseconds for fast push command detection)
+    // 3. Connect SSE for real-time CMS push commands
+    startSseConnection();
+
+    // 4. Start Heartbeat (every 500 milliseconds for fast push command detection)
     if (heartbeatInterval) clearInterval(heartbeatInterval);
     heartbeatInterval = setInterval(sendHeartbeat, 500);
     sendHeartbeat(); // send initial heartbeat immediately
@@ -190,6 +195,10 @@ async function sendHeartbeat() {
                 handleRefreshCommand();
             } else if (cmd === 'restart_service') {
                 handleRestartCommand();
+            } else if (cmd === 'set_volume') {
+                const volume = typeof response.data.volume === 'number' ? Math.max(0, Math.min(100, response.data.volume)) : config.volume;
+                const muted = typeof response.data.muted === 'boolean' ? response.data.muted : config.muted;
+                applyVolume(volume, muted);
             }
         }
 
@@ -239,6 +248,10 @@ function handleCMSCommand(data) {
         if (mainWindow) mainWindow.webContents.send('stop-capture');
     } else if (['play', 'pause', 'next', 'previous', 'restart'].includes(cmd)) {
         if (mainWindow) mainWindow.webContents.send('control-command', cmd);
+    } else if (cmd === 'set_volume') {
+        const volume = typeof data.volume === 'number' ? Math.max(0, Math.min(100, data.volume)) : config.volume;
+        const muted = typeof data.muted === 'boolean' ? data.muted : config.muted;
+        applyVolume(volume, muted);
     } else if (cmd === 'delete_player') {
         console.log("[CMS DELETION DETECTED] This player was removed from the portal.");
         config.player_id = null;
@@ -249,6 +262,32 @@ function handleCMSCommand(data) {
              mainWindow.webContents.send('prompt-cms-url', config.cms_url);
         }
     }
+}
+
+function applyVolume(volume, muted) {
+    config.volume = volume;
+    config.muted = muted;
+    saveConfig();
+    if (mainWindow) mainWindow.webContents.send('set-volume', { volume, muted });
+    console.log(`[VOLUME] volume=${volume} muted=${muted}`);
+}
+
+let sseConnection = null;
+
+function startSseConnection() {
+    if (!config.cms_url || !config.player_id) return;
+    if (sseConnection) { sseConnection.close(); sseConnection = null; }
+
+    const { EventSource } = require('eventsource');
+    const url = `${config.cms_url}/api/v1/players/${config.player_id}/events`;
+    console.log(`[SSE] Connecting to ${url}`);
+
+    sseConnection = new EventSource(url);
+    sseConnection.onmessage = (event) => {
+        try { handleCMSCommand(JSON.parse(event.data)); }
+        catch (e) { console.error('[SSE] Parse error:', e.message); }
+    };
+    sseConnection.onerror = () => console.warn('[SSE] Connection lost, retrying...');
 }
 
 let refreshInProgress = false;
@@ -517,6 +556,8 @@ function createWindow() {
              mainWindow.webContents.send('hide-enrollment-code');
              startPlayerRoutines();
          }
+         // Restore persisted volume on every page load (including after refresh command)
+         mainWindow.webContents.send('set-volume', { volume: config.volume, muted: config.muted });
     });
 }
 
