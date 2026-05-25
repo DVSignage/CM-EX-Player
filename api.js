@@ -227,5 +227,20 @@ module.exports = function setupApi(getMainWindow, CACHE_DIR) {
     });
 
     const API_PORT = 8081;
-    apiApp.listen(API_PORT, () => console.log(`Local API listening on port ${API_PORT}`));
+    const server = apiApp.listen(API_PORT, () => console.log(`Local API listening on port ${API_PORT}`));
+    server.on('error', (err) => {
+        if (err.code === 'EADDRINUSE') {
+            const { dialog, app } = require('electron');
+            dialog.showMessageBoxSync({
+                type: 'error',
+                title: 'Port Already In Use',
+                message: `CMX Player cannot start because port ${API_PORT} is already in use.`,
+                detail: 'Another instance of CMX Player may already be running.\n\nClose it and try again, or check Task Manager for a lingering process.',
+                buttons: ['OK']
+            });
+            app.quit();
+        } else {
+            console.error('API server error:', err);
+        }
+    });
 };
