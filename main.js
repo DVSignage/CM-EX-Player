@@ -6,6 +6,8 @@ const axios = require('axios');
 const fs = require('fs');
 const os = require('os');
 
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+
 let mainWindow;
 
 // --- CONFIGURATION ---
@@ -20,7 +22,9 @@ if (!fs.existsSync(CACHE_DIR)) {
 
 let config = {
     cms_url: '',
-    player_id: null
+    player_id: null,
+    volume: 100,
+    muted: false
 };
 
 // Load config if exists
@@ -36,9 +40,6 @@ if (fs.existsSync(CONFIG_PATH)) {
 function saveConfig() {
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
 }
-
-// --- EXPRESS SERVER FOR 3RD PARTY APIs ---
-require('./api')(() => mainWindow, CACHE_DIR);
 
 // --- CMS INTEGRATION LOGIC ---
 
@@ -112,7 +113,10 @@ function startPlayerRoutines() {
     // 2. Fetch latest from CMS in background — updates playlist if anything changed
     fetchPlaylist();
 
-    // 3. Start Heartbeat (every 500 milliseconds for fast push command detection)
+    // 3. Connect SSE for real-time CMS push commands
+    startSseConnection();
+
+    // 4. Start Heartbeat (every 500 milliseconds for fast push command detection)
     if (heartbeatInterval) clearInterval(heartbeatInterval);
     heartbeatInterval = setInterval(sendHeartbeat, 500);
     sendHeartbeat(); // send initial heartbeat immediately
@@ -187,6 +191,14 @@ async function sendHeartbeat() {
                 if (mainWindow) mainWindow.webContents.send('stop-capture');
             } else if (['play', 'pause', 'next', 'previous', 'restart'].includes(cmd)) {
                 if (mainWindow) mainWindow.webContents.send('control-command', cmd);
+            } else if (cmd === 'refresh') {
+                handleRefreshCommand();
+            } else if (cmd === 'restart_service') {
+                handleRestartCommand();
+            } else if (cmd === 'set_volume') {
+                const volume = typeof response.data.volume === 'number' ? Math.max(0, Math.min(100, response.data.volume)) : config.volume;
+                const muted = typeof response.data.muted === 'boolean' ? response.data.muted : config.muted;
+                applyVolume(volume, muted);
             }
         }
 
@@ -236,6 +248,10 @@ function handleCMSCommand(data) {
         if (mainWindow) mainWindow.webContents.send('stop-capture');
     } else if (['play', 'pause', 'next', 'previous', 'restart'].includes(cmd)) {
         if (mainWindow) mainWindow.webContents.send('control-command', cmd);
+    } else if (cmd === 'set_volume') {
+        const volume = typeof data.volume === 'number' ? Math.max(0, Math.min(100, data.volume)) : config.volume;
+        const muted = typeof data.muted === 'boolean' ? data.muted : config.muted;
+        applyVolume(volume, muted);
     } else if (cmd === 'delete_player') {
         console.log("[CMS DELETION DETECTED] This player was removed from the portal.");
         config.player_id = null;
@@ -246,6 +262,61 @@ function handleCMSCommand(data) {
              mainWindow.webContents.send('prompt-cms-url', config.cms_url);
         }
     }
+}
+
+function applyVolume(volume, muted) {
+    config.volume = volume;
+    config.muted = muted;
+    saveConfig();
+    if (mainWindow) mainWindow.webContents.send('set-volume', { volume, muted });
+    console.log(`[VOLUME] volume=${volume} muted=${muted}`);
+}
+
+let sseConnection = null;
+
+function startSseConnection() {
+    if (!config.cms_url || !config.player_id) return;
+    if (sseConnection) { sseConnection.close(); sseConnection = null; }
+
+    const { EventSource } = require('eventsource');
+    const url = `${config.cms_url}/api/v1/players/${config.player_id}/events`;
+    console.log(`[SSE] Connecting to ${url}`);
+
+    sseConnection = new EventSource(url);
+    sseConnection.onmessage = (event) => {
+        try { handleCMSCommand(JSON.parse(event.data)); }
+        catch (e) { console.error('[SSE] Parse error:', e.message); }
+    };
+    sseConnection.onerror = () => console.warn('[SSE] Connection lost, retrying...');
+}
+
+let refreshInProgress = false;
+
+function handleRefreshCommand() {
+    if (refreshInProgress || !mainWindow) return;
+    refreshInProgress = true;
+    console.log('[CMD] Refresh: reloading renderer...');
+
+    mainWindow.webContents.reload();
+
+    mainWindow.webContents.once('did-finish-load', async () => {
+        refreshInProgress = false;
+        try {
+            await axios.post(`${config.cms_url}/api/v1/players/${config.player_id}/ack`, {
+                success: true,
+                message: 'Refresh completed'
+            });
+            console.log('[CMD] Refresh ACK sent.');
+        } catch (e) {
+            console.error('[CMD] Refresh ACK failed:', e.message);
+        }
+    });
+}
+
+function handleRestartCommand() {
+    console.log('[CMD] Restart: relaunching app...');
+    app.relaunch();
+    app.exit(0);
 }
 
 async function fetchPlaylist() {
@@ -344,7 +415,7 @@ async function processAndDownloadPlaylist(playlistData) {
 
      // Progressive Initial Playback Structure
      if (mainWindow && filesToProcess.length > 0) {
-         // Aggressively clear old playlist so user immediately sees a change happened when downloading
+         global.last_sent_playlist_key = null; // playlist is changing, allow next cached send through
          mainWindow.webContents.send('update-playlist', []);
      }
 
@@ -403,9 +474,14 @@ async function processAndDownloadPlaylist(playlistData) {
              mainWindow.webContents.send('append-playlist', finalLocalPathsArray);
          }
      } else {
-         // All files are already cached, push instantly
+         // All files are already cached — skip if playlist is identical to what's already playing
+         const playlistKey = finalLocalPathsArray.join('|');
+         if (playlistKey === global.last_sent_playlist_key) {
+             console.log("[PLAYLIST] Unchanged, skipping redundant update.");
+             return;
+         }
+         global.last_sent_playlist_key = playlistKey;
          if (mainWindow) {
-             // download-progress overlay removed
              mainWindow.webContents.send('update-playlist', finalLocalPathsArray);
          }
      }
@@ -463,6 +539,7 @@ function createWindow() {
         alwaysOnTop: true,
         kiosk: true,
         autoHideMenuBar: true,
+        icon: path.join(__dirname, 'app.ico'),
         webPreferences: {
             preload: path.join(__dirname, 'preload.js'),
             nodeIntegration: false,
@@ -480,10 +557,14 @@ function createWindow() {
              mainWindow.webContents.send('hide-enrollment-code');
              startPlayerRoutines();
          }
+         // Restore persisted volume on every page load (including after refresh command)
+         mainWindow.webContents.send('set-volume', { volume: config.volume, muted: config.muted });
     });
 }
 
 app.whenReady().then(() => {
+    require('./api')(() => mainWindow, CACHE_DIR);
+
     ipcMain.on('submit-cms-url', (event, url) => {
         config.cms_url = url;
         saveConfig();

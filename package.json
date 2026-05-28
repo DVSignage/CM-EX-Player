@@ -10,7 +10,8 @@
     "appId": "com.antigravity.cmxplayer",
     "productName": "CMX Player",
     "win": {
-      "target": "nsis"
+      "target": "nsis",
+      "icon": "app.ico"
     }
   },
   "dependencies": {

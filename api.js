@@ -227,5 +227,19 @@ module.exports = function setupApi(getMainWindow, CACHE_DIR) {
     });
 
     const API_PORT = 8081;
-    apiApp.listen(API_PORT, () => console.log(`Local API listening on port ${API_PORT}`));
+    const server = apiApp.listen(API_PORT, () => console.log(`Local API listening on port ${API_PORT}`));
+    server.on('error', (err) => {
+        if (err.code === 'EADDRINUSE') {
+            const { dialog, app } = require('electron');
+            dialog.showMessageBox({
+                type: 'warning',
+                title: 'Port Already In Use',
+                message: `Local API (port ${API_PORT}) is unavailable.`,
+                detail: 'Another instance of CMX Player may already be running. Third-party API control will not work, but the player will continue normally.',
+                buttons: ['OK']
+            });
+        } else {
+            console.error('API server error:', err);
+        }
+    });
 };
