@@ -17,9 +17,12 @@
 
 const path = require('path');
 const fs = require('fs');
+const logger = require('./logger');
 
 let macadam = null;
 let available = false;
+let unavailableReason = null; // human-readable explanation when available === false
+let lastError = null;         // most recent runtime error (enumeration/capture)
 
 // Prepend the bundled Desktop Video runtime folder to PATH before requiring the
 // addon, so its dependent DLLs resolve in a packaged build (resourcesPath) as
@@ -42,9 +45,18 @@ try {
     prepRuntimePath();
     macadam = require('macadam');
     available = true;
-    console.log('[DECKLINK] macadam loaded — DeckLink capture available');
+    logger.info('[DECKLINK] macadam loaded — DeckLink capture available');
 } catch (err) {
-    console.warn('[DECKLINK] macadam unavailable — DeckLink capture disabled:', err.message);
+    // Classify the failure so the log explains what to fix, not just "disabled".
+    const msg = (err && err.message) || String(err);
+    if (err && err.code === 'MODULE_NOT_FOUND' && /macadam/.test(msg)) {
+        unavailableReason = "'macadam' native addon is not installed — add it to package.json (file:vendor/macadam) and run npm install";
+    } else if (/dlopen|specified module could not be found|\.dll/i.test(msg)) {
+        unavailableReason = "macadam loaded but the DeckLink runtime is missing — install Blackmagic Desktop Video on this machine";
+    } else {
+        unavailableReason = msg;
+    }
+    logger.error('[DECKLINK] macadam unavailable — DeckLink capture disabled:', unavailableReason, err);
 }
 
 let activeCapture = null;
@@ -69,6 +81,18 @@ function isAvailable() {
     return available;
 }
 
+// Diagnostic snapshot for the heartbeat / local API so an operator can see why
+// DeckLink is off (or what last went wrong) without reading the log file.
+// Kept lightweight — does not enumerate devices (the heartbeat calls
+// listSources() separately every 500ms).
+function getStatus() {
+    return {
+        available,
+        reason: available ? null : unavailableReason,
+        lastError,
+    };
+}
+
 // Enumerate connected DeckLink devices. Each HDMI input on a Quad HDMI Recorder
 // appears as its own device, so the array index is the `deviceIndex` used to
 // start capture. Includes the device's supported input display modes so the
@@ -90,7 +114,8 @@ function listSources() {
             })),
         }));
     } catch (err) {
-        console.error('[DECKLINK] listSources failed:', err.message);
+        lastError = err.message;
+        logger.error('[DECKLINK] listSources failed:', err.message);
         return [];
     }
 }
@@ -120,7 +145,7 @@ function resolveDisplayMode(value) {
             if (typeof macadam[c] === 'number') return macadam[c];
         }
     }
-    console.warn(`[DECKLINK] Unknown display mode "${str}" — falling back to auto-probe`);
+    logger.warn(`[DECKLINK] Unknown display mode "${str}" — falling back to auto-probe`);
     return null;
 }
 
@@ -190,7 +215,7 @@ async function start(config, onFrame) {
         if (frame && frame.video && frame.video.data) {
             firstFrame = frame;
             usedMode = mode;
-            console.log(`[DECKLINK] Device ${deviceIndex} locked on ${modeName(mode)}`);
+            logger.info(`[DECKLINK] Device ${deviceIndex} locked on ${modeName(mode)}`);
             break;
         }
         try { await capture.stop(); } catch (_) { /* ignore */ }
@@ -199,7 +224,8 @@ async function start(config, onFrame) {
 
     if (!capture) {
         lastWorkingMode.delete(deviceIndex);
-        throw new Error(`No signal detected on DeckLink input ${deviceIndex} (tried ${probeList.length} formats)`);
+        lastError = `No signal detected on DeckLink input ${deviceIndex} (tried ${probeList.length} formats)`;
+        throw new Error(lastError);
     }
 
     lastWorkingMode.set(deviceIndex, usedMode);
@@ -217,7 +243,8 @@ async function start(config, onFrame) {
                     data: frame.video.data,
                 });
             } catch (err) {
-                console.error('[DECKLINK] onFrame handler failed:', err.message);
+                lastError = err.message;
+                logger.error('[DECKLINK] onFrame handler failed:', err.message);
             }
         }
     };
@@ -232,7 +259,7 @@ async function start(config, onFrame) {
             try {
                 frame = await activeCapture.frame();
             } catch (err) {
-                if (capturing) console.error('[DECKLINK] frame error:', err.message);
+                if (capturing) { lastError = err.message; logger.error('[DECKLINK] frame error:', err.message); }
                 break;
             }
             if (!capturing) break;
@@ -252,4 +279,4 @@ async function stop() {
     }
 }
 
-module.exports = { isAvailable, listSources, start, stop };
+module.exports = { isAvailable, getStatus, listSources, start, stop };

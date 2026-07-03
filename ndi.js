@@ -9,9 +9,12 @@
 
 const path = require('path');
 const fs = require('fs');
+const logger = require('./logger');
 
 let grandiose = null;
 let available = false;
+let unavailableReason = null; // human-readable explanation when available === false
+let lastError = null;         // most recent runtime error (discovery/receive/start)
 
 function prepRuntimePath() {
     const candidates = [];
@@ -31,9 +34,18 @@ try {
     prepRuntimePath();
     grandiose = require('grandiose');
     available = true;
-    console.log('[NDI] grandiose loaded — NDI receive available');
+    logger.info('[NDI] grandiose loaded — NDI receive available');
 } catch (err) {
-    console.warn('[NDI] grandiose unavailable — NDI receive disabled:', err.message);
+    // Classify the failure so the log explains what to fix, not just "disabled".
+    const msg = (err && err.message) || String(err);
+    if (err && err.code === 'MODULE_NOT_FOUND' && /grandiose/.test(msg)) {
+        unavailableReason = "'grandiose' native addon is not installed — add it to package.json, run npm install, then rebuild it against Electron";
+    } else if (/dlopen|specified module could not be found|\.dll/i.test(msg)) {
+        unavailableReason = "grandiose loaded but its NDI runtime DLL is missing — place Processing.NDI.Lib.x64.dll in a 'runtime/ndi' folder next to the app";
+    } else {
+        unavailableReason = msg;
+    }
+    logger.error('[NDI] grandiose unavailable — NDI receive disabled:', unavailableReason, err);
 }
 
 let finder = null;
@@ -65,7 +77,8 @@ async function refreshSources() {
         }
     } catch (err) {
         // Keep the previous cache on transient discovery errors.
-        console.error('[NDI] source discovery failed:', err.message);
+        lastError = err.message;
+        logger.error('[NDI] source discovery failed:', err.message);
     }
 }
 
@@ -77,6 +90,17 @@ function startDiscovery() {
 
 function isAvailable() {
     return available;
+}
+
+// Diagnostic snapshot for the heartbeat / local API so an operator can see why
+// NDI is off (or what last went wrong) without reading the log file.
+function getStatus() {
+    return {
+        available,
+        reason: available ? null : unavailableReason,
+        lastError,
+        sourceCount: cachedSources.length,
+    };
 }
 
 function listSources() {
@@ -92,7 +116,7 @@ function resolveBandwidth(name) {
 // Start receiving from a named source. `onFrame` receives
 // { format:'BGRA', width, height, rowBytes, data } where data is a Node Buffer.
 async function start(config, onFrame) {
-    if (!available) throw new Error('NDI not available');
+    if (!available) throw new Error('NDI not available' + (unavailableReason ? `: ${unavailableReason}` : ''));
     await stop();
 
     const sourceName = config && config.sourceName;
@@ -100,6 +124,7 @@ async function start(config, onFrame) {
     if (!source && sourceName) source = { name: sourceName };
     if (!source) throw new Error('No NDI source specified');
 
+    logger.info('[NDI] starting receive from source:', source.name);
     receiver = await grandiose.receive({
         source,
         colorFormat: grandiose.COLOR_FORMAT_BGRX_BGRA,
@@ -120,7 +145,8 @@ async function start(config, onFrame) {
                 // don't spin or freeze on a dead source.
                 if (!receiving) break;
                 if (++consecutiveErrors > 5) {
-                    console.error('[NDI] receive stopped after repeated errors:', err.message);
+                    lastError = err.message;
+                    logger.error('[NDI] receive stopped after repeated errors:', err.message);
                     break;
                 }
                 continue;
@@ -136,7 +162,8 @@ async function start(config, onFrame) {
                         data: frame.data,
                     });
                 } catch (err) {
-                    console.error('[NDI] onFrame handler failed:', err.message);
+                    lastError = err.message;
+                    logger.error('[NDI] onFrame handler failed:', err.message);
                 }
             }
         }
@@ -152,4 +179,4 @@ async function stop() {
     receiver = null;
 }
 
-module.exports = { isAvailable, listSources, start, stop, startDiscovery };
+module.exports = { isAvailable, getStatus, listSources, start, stop, startDiscovery };

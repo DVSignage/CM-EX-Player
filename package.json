@@ -12,18 +12,22 @@
     "productName": "CMX Player",
     "asarUnpack": [
       "node_modules/macadam/**",
+      "node_modules/grandiose/**",
       "**/*.node"
     ],
     "win": {
       "target": "nsis",
-      "icon": "app.ico"
+      "icon": "app.ico",
+      "signAndEditExecutable": false
     }
   },
   "dependencies": {
     "axios": "^1.6.2",
     "cors": "^2.8.5",
     "eventsource": "^4.1.0",
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "grandiose": "file:vendor/grandiose",
+    "macadam": "file:vendor/macadam"
   },
   "devDependencies": {
     "electron": "^28.0.0",

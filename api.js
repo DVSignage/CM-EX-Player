@@ -4,11 +4,26 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
+const logger = require('./logger');
 
 module.exports = function setupApi(getMainWindow, CACHE_DIR, providers) {
     providers = providers || {};
-    const ndi = providers.ndi || { isAvailable: () => false, listSources: () => [] };
-    const decklink = providers.decklink || { isAvailable: () => false, listSources: () => [] };
+    const ndi = providers.ndi || {
+        isAvailable: () => false,
+        listSources: () => [],
+        getStatus: () => ({ available: false, reason: 'NDI provider not wired', lastError: null, sourceCount: 0 }),
+    };
+    const ndiStatus = () => (typeof ndi.getStatus === 'function'
+        ? ndi.getStatus()
+        : { available: ndi.isAvailable(), reason: null, lastError: null, sourceCount: 0 });
+    const decklink = providers.decklink || {
+        isAvailable: () => false,
+        listSources: () => [],
+        getStatus: () => ({ available: false, reason: 'DeckLink provider not wired', lastError: null }),
+    };
+    const decklinkStatus = () => (typeof decklink.getStatus === 'function'
+        ? decklink.getStatus()
+        : { available: decklink.isAvailable(), reason: null, lastError: null });
     const apiApp = express();
     apiApp.use(cors());
     apiApp.use(express.json());
@@ -109,7 +124,12 @@ module.exports = function setupApi(getMainWindow, CACHE_DIR, providers) {
                 `navigator.mediaDevices.enumerateDevices().then(d => d.filter(x => x.kind === "videoinput").map(x => ({deviceId: x.deviceId, label: x.label})))`
             );
             // DeckLink devices are not visible to getUserMedia — list them separately.
-            res.json({ devices, decklink_devices: decklink.listSources() });
+            res.json({
+                devices,
+                decklink_devices: decklink.listSources(),
+                decklink_supported: decklink.isAvailable(),
+                decklink_reason: decklinkStatus().reason || null,
+            });
         } catch (err) {
             console.error('[CAPTURE] Device enumeration error:', err.message);
             res.status(500).json({ error: 'Failed to enumerate capture devices', details: err.message });
@@ -160,7 +180,13 @@ module.exports = function setupApi(getMainWindow, CACHE_DIR, providers) {
     // --- NDI Endpoints ---
 
     apiApp.get('/api/ndi/sources', (req, res) => {
-        res.json({ available: ndi.isAvailable(), sources: ndi.listSources() });
+        const status = ndiStatus();
+        res.json({
+            available: status.available,
+            reason: status.reason || null,
+            last_error: status.lastError || null,
+            sources: ndi.listSources(),
+        });
     });
 
     apiApp.post('/api/ndi/start', (req, res) => {
@@ -263,7 +289,10 @@ module.exports = function setupApi(getMainWindow, CACHE_DIR, providers) {
             cache_limit_bytes: 50 * 1024 * 1024 * 1024,
             capture_supported: true,
             decklink_supported: decklink.isAvailable(),
+            decklink_reason: decklinkStatus().reason || null,
             ndi_supported: ndi.isAvailable(),
+            ndi_reason: ndiStatus().reason || null,
+            log_file: logger.getLogPath(),
             preview_supported: true,
             preview: {
                 stream_url: `http://${ip}:${API_PORT}/api/preview/stream`,

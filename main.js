@@ -8,6 +8,7 @@ const os = require('os');
 
 // Native live-input producers. Each degrades to an unavailable no-op if its
 // addon/runtime is missing, so the rest of the player is unaffected.
+const logger = require('./logger');
 const ndi = require('./ndi');
 const decklink = require('./decklink');
 
@@ -84,9 +85,14 @@ function stopAllNativeInputs() {
 async function handleShowCapture(data) {
     const kind = (data.capture_kind || '').toLowerCase();
     const label = data.capture_device_label || '';
-    const isDeckLink = kind === 'decklink' || /decklink|blackmagic/i.test(label);
+    // Coerce the index up front: the CMS sometimes sends it as a string ("2"),
+    // which would otherwise slip past decklink.start's Number.isInteger guard and
+    // silently capture HDMI input 0 — the wrong port on a Quad HDMI Recorder.
+    const parsedIndex = parseInt(data.capture_device_index, 10);
+    const deviceIndex = Number.isInteger(parsedIndex) ? parsedIndex : 0;
+    const isDeckLink = kind === 'decklink' || kind === 'blackmagic' || /decklink|blackmagic/i.test(label);
     if (isDeckLink) {
-        await startDeckLink({ deviceIndex: data.capture_device_index, label, displayMode: data.capture_display_mode });
+        await startDeckLink({ deviceIndex, label, displayMode: data.capture_display_mode });
     } else {
         stopAllNativeInputs();
         if (mainWindow) {
@@ -104,14 +110,17 @@ async function startDeckLink(cfg) {
     if (!mainWindow) return;
     mainWindow.webContents.send('stop-capture'); // clear any getUserMedia overlay
     if (!decklink.isAvailable()) {
-        mainWindow.webContents.send('start-live', { kind: 'decklink', available: false, label: cfg.label });
+        const reason = decklink.getStatus().reason;
+        logger.warn('[DECKLINK] show_capture requested but DeckLink is unavailable:', reason);
+        mainWindow.webContents.send('start-live', { kind: 'decklink', available: false, error: reason, label: cfg.label });
         return;
     }
+    logger.info(`[DECKLINK] starting capture: deviceIndex=${cfg.deviceIndex} displayMode=${cfg.displayMode || 'auto'}`);
     mainWindow.webContents.send('start-live', { kind: 'decklink', available: true, label: cfg.label });
     try {
         await decklink.start({ deviceIndex: cfg.deviceIndex, displayMode: cfg.displayMode }, sendFrame);
     } catch (err) {
-        console.error('[DECKLINK] start failed:', err.message);
+        logger.error('[DECKLINK] start failed:', err.message);
         mainWindow.webContents.send('start-live', { kind: 'decklink', available: false, error: err.message, label: cfg.label });
     }
 }
@@ -121,14 +130,16 @@ async function startNdi(cfg) {
     if (!mainWindow) return;
     mainWindow.webContents.send('stop-capture');
     if (!ndi.isAvailable()) {
-        mainWindow.webContents.send('start-live', { kind: 'ndi', available: false, label: cfg.sourceName });
+        const reason = ndi.getStatus().reason;
+        logger.warn('[NDI] show_ndi requested but NDI is unavailable:', reason);
+        mainWindow.webContents.send('start-live', { kind: 'ndi', available: false, error: reason, label: cfg.sourceName });
         return;
     }
     mainWindow.webContents.send('start-live', { kind: 'ndi', available: true, label: cfg.sourceName });
     try {
         await ndi.start({ sourceName: cfg.sourceName, bandwidth: cfg.bandwidth }, sendFrame);
     } catch (err) {
-        console.error('[NDI] start failed:', err.message);
+        logger.error('[NDI] start failed:', err.message);
         mainWindow.webContents.send('start-live', { kind: 'ndi', available: false, error: err.message, label: cfg.sourceName });
     }
 }
@@ -139,7 +150,20 @@ function stopLive() {
 }
 
 // Begin background NDI source discovery (cached; never blocks the heartbeat).
-if (ndi.isAvailable()) ndi.startDiscovery();
+// If NDI is unavailable, record why once at boot so the log explains it.
+if (ndi.isAvailable()) {
+    ndi.startDiscovery();
+} else {
+    logger.warn('[NDI] discovery not started — NDI unavailable:', ndi.getStatus().reason);
+}
+
+// Record DeckLink availability once at boot so the log explains it either way.
+if (decklink.isAvailable()) {
+    logger.info('[DECKLINK] available at boot; devices:', decklink.listSources().length);
+} else {
+    logger.warn('[DECKLINK] unavailable at boot:', decklink.getStatus().reason);
+}
+logger.info('[BOOT] Log file:', logger.getLogPath());
 
 // --- CMS INTEGRATION LOGIC ---
 
@@ -242,7 +266,11 @@ async function sendHeartbeat() {
              timestamp: new Date().toISOString(),
              capture_devices: captureDevices,
              decklink_devices: deckLinkDevices,
-             ndi_sources: ndi.listSources()
+             decklink_supported: decklink.isAvailable(),
+             decklink_reason: decklink.getStatus().reason || null,
+             ndi_sources: ndi.listSources(),
+             ndi_supported: ndi.isAvailable(),
+             ndi_reason: ndi.getStatus().reason || null
         });
 
         if (response.data && response.data.command && response.data.command !== 'none') {

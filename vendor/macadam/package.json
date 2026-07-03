@@ -1,0 +1,38 @@
+{
+  "name": "macadam",
+  "version": "2.0.18",
+  "description": "Async node.js interface to Blackmagic Design capture and playback devices.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "keywords": [
+    "blackmagic",
+    "SDI",
+    "playback",
+    "capture",
+    "decklink",
+    "video",
+    "sound"
+  ],
+  "scripts": {
+    "install": "node-gyp rebuild",
+    "build": "node-gyp rebuild",
+    "test": "tape test/*Spec.js",
+    "lint": "eslint index.js **/*.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Streampunk/macadam.git"
+  },
+  "author": "Streampunk Media Ltd",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/Streampunk/macadam/issues"
+  },
+  "homepage": "https://github.com/Streampunk/macadam#readme",
+  "dependencies": {
+    "bindings": "^1.5.0",
+    "highland": "^2.13.5"
+  },
+  "gypfile": true,
+  "devDependencies": {}
+}
