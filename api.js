@@ -5,7 +5,10 @@ const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
 
-module.exports = function setupApi(getMainWindow, CACHE_DIR) {
+module.exports = function setupApi(getMainWindow, CACHE_DIR, providers) {
+    providers = providers || {};
+    const ndi = providers.ndi || { isAvailable: () => false, listSources: () => [] };
+    const decklink = providers.decklink || { isAvailable: () => false, listSources: () => [] };
     const apiApp = express();
     apiApp.use(cors());
     apiApp.use(express.json());
@@ -105,7 +108,8 @@ module.exports = function setupApi(getMainWindow, CACHE_DIR) {
             const devices = await mainWindow.webContents.executeJavaScript(
                 `navigator.mediaDevices.enumerateDevices().then(d => d.filter(x => x.kind === "videoinput").map(x => ({deviceId: x.deviceId, label: x.label})))`
             );
-            res.json({ devices });
+            // DeckLink devices are not visible to getUserMedia — list them separately.
+            res.json({ devices, decklink_devices: decklink.listSources() });
         } catch (err) {
             console.error('[CAPTURE] Device enumeration error:', err.message);
             res.status(500).json({ error: 'Failed to enumerate capture devices', details: err.message });
@@ -117,7 +121,19 @@ module.exports = function setupApi(getMainWindow, CACHE_DIR) {
         if (!mainWindow) {
             return res.status(503).json({ error: 'Player window not available' });
         }
-        const { deviceId, width, height } = req.body || {};
+        const body = req.body || {};
+        const kind = (body.kind || '').toLowerCase();
+        const isDeckLink = kind === 'decklink' || Number.isInteger(body.deviceIndex);
+        // DeckLink capture routes through the native SDK path in main.js.
+        if (isDeckLink) {
+            if (typeof providers.startDeckLink !== 'function') {
+                return res.status(500).json({ error: 'DeckLink routing unavailable' });
+            }
+            const cfg = { deviceIndex: body.deviceIndex || 0, label: body.label, displayMode: body.displayMode };
+            providers.startDeckLink(cfg);
+            return res.json({ status: 'success', message: 'DeckLink capture started', config: cfg });
+        }
+        const { deviceId, width, height } = body;
         if (!deviceId) {
             return res.status(400).json({ error: 'deviceId is required' });
         }
@@ -126,6 +142,7 @@ module.exports = function setupApi(getMainWindow, CACHE_DIR) {
             width: width || 1920,
             height: height || 1080
         };
+        if (typeof providers.stopLive === 'function') providers.stopLive();
         mainWindow.webContents.send('start-capture', captureConfig);
         res.json({ status: 'success', message: 'Capture started', config: captureConfig });
     });
@@ -135,8 +152,40 @@ module.exports = function setupApi(getMainWindow, CACHE_DIR) {
         if (!mainWindow) {
             return res.status(503).json({ error: 'Player window not available' });
         }
+        if (typeof providers.stopLive === 'function') providers.stopLive();
         mainWindow.webContents.send('stop-capture');
         res.json({ status: 'success', message: 'Capture stopped, resuming playlist' });
+    });
+
+    // --- NDI Endpoints ---
+
+    apiApp.get('/api/ndi/sources', (req, res) => {
+        res.json({ available: ndi.isAvailable(), sources: ndi.listSources() });
+    });
+
+    apiApp.post('/api/ndi/start', (req, res) => {
+        const mainWindow = getMainWindow();
+        if (!mainWindow) {
+            return res.status(503).json({ error: 'Player window not available' });
+        }
+        if (typeof providers.startNdi !== 'function') {
+            return res.status(500).json({ error: 'NDI routing unavailable' });
+        }
+        const { sourceName, bandwidth } = req.body || {};
+        if (!sourceName) {
+            return res.status(400).json({ error: 'sourceName is required' });
+        }
+        providers.startNdi({ sourceName, bandwidth });
+        res.json({ status: 'success', message: 'NDI receive started', config: { sourceName, bandwidth } });
+    });
+
+    apiApp.post('/api/ndi/stop', (req, res) => {
+        const mainWindow = getMainWindow();
+        if (!mainWindow) {
+            return res.status(503).json({ error: 'Player window not available' });
+        }
+        if (typeof providers.stopLive === 'function') providers.stopLive();
+        res.json({ status: 'success', message: 'NDI receive stopped, resuming playlist' });
     });
 
     // --- Existing Playback Control Endpoints ---
@@ -213,6 +262,8 @@ module.exports = function setupApi(getMainWindow, CACHE_DIR) {
             memory_free_bytes: os.freemem(),
             cache_limit_bytes: 50 * 1024 * 1024 * 1024,
             capture_supported: true,
+            decklink_supported: decklink.isAvailable(),
+            ndi_supported: ndi.isAvailable(),
             preview_supported: true,
             preview: {
                 stream_url: `http://${ip}:${API_PORT}/api/preview/stream`,

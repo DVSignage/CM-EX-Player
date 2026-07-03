@@ -15,6 +15,7 @@ Electron-based digital signage player for Windows with NDI support.
 - Node.js 20+
 - Windows 10/11
 - NDI Runtime (optional, for NDI features)
+- Blackmagic Desktop Video ≥ 10.11.2 (optional, required for DeckLink capture — both to build the `macadam` native module and at runtime on player machines with a DeckLink card, e.g. the Quad HDMI Recorder)
 
 ## Quick Start
 

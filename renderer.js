@@ -2,6 +2,8 @@ const playerA = document.getElementById('playerA');
 const playerB = document.getElementById('playerB');
 const imagePlayer = document.getElementById('imagePlayer');
 const capturePlayer = document.getElementById('capturePlayer');
+const liveCanvas = document.getElementById('liveCanvas');
+const liveCtx = liveCanvas ? liveCanvas.getContext('2d') : null;
 const debugInfo = document.getElementById('debug-info');
 
 let activePlayer = playerA;
@@ -11,6 +13,15 @@ let captureStream = null;
 let captureActive = false;
 let imageTimer = null;
 let currentCrop = null; // video wall crop region { x, y, w, h } normalised 0.0–1.0
+
+// --- Native live input (DeckLink / NDI) state ---
+let liveActive = false;
+let liveInfo = null;         // { kind, available, label, error }
+let framePort = null;        // MessagePort delivering raw frames from main
+let latestFrame = null;      // most recent { format, width, height, rowBytes, buffer }
+let liveRAF = null;          // requestAnimationFrame handle for the draw loop
+let liveRgba = null;         // reused Uint8ClampedArray for RGBA output
+let liveImageData = null;    // reused ImageData bound to liveRgba
 
 const IMAGE_DEFAULT_DURATION_MS = 10000;
 
@@ -209,6 +220,9 @@ async function startCapture(config) {
     try {
         // Stop any existing capture first
         stopCapture();
+        // Mutual exclusion: a getUserMedia capture replaces any native live input.
+        if (liveActive) stopLiveSource();
+        if (window.playerAPI && window.playerAPI.requestStopLive) window.playerAPI.requestStopLive();
 
         const devices = await navigator.mediaDevices.enumerateDevices();
         const videoDevices = devices.filter(d => d.kind === 'videoinput');
@@ -277,6 +291,174 @@ function stopCapture() {
         updateDebug('Capture stopped, resuming playlist');
         console.log('[CAPTURE] Capture stopped');
     }
+}
+
+// --- Native Live Input (DeckLink / NDI) ---
+
+function showLiveCanvas() {
+    // Mirror the capture overlay: hide/pause the A/B players, show the canvas.
+    playerA.style.display = 'none';
+    playerA.pause();
+    playerB.style.display = 'none';
+    playerB.pause();
+    if (liveCanvas) liveCanvas.style.display = 'block';
+}
+
+function hideLiveCanvas() {
+    if (liveCanvas) liveCanvas.style.display = 'none';
+    playerA.style.display = '';
+    playerB.style.display = '';
+    activePlayer.classList.remove('hidden');
+    activePlayer.classList.add('active');
+    if (playlist.length > 0) {
+        activePlayer.play().catch(e => console.error(e));
+    }
+}
+
+// Receive the frame-delivery MessagePort from main (once per renderer load).
+function attachFramePort(port) {
+    framePort = port;
+    framePort.onmessage = (event) => { latestFrame = event.data; };
+    if (framePort.start) framePort.start();
+}
+
+function ensureRgbaBuffers(width, height) {
+    const needed = width * height * 4;
+    if (!liveRgba || liveRgba.length !== needed) {
+        liveRgba = new Uint8ClampedArray(needed);
+        liveImageData = new ImageData(liveRgba, width, height);
+    }
+}
+
+function clampByte(v) {
+    return v < 0 ? 0 : (v > 255 ? 255 : v);
+}
+
+// BGRA/BGRX (NDI) → RGBA, honouring row stride.
+function drawBGRA(frame) {
+    const { width, height, buffer, rowBytes } = frame;
+    const src = new Uint8Array(buffer);
+    const stride = rowBytes || width * 4;
+    ensureRgbaBuffers(width, height);
+    const out = liveRgba;
+    for (let y = 0; y < height; y++) {
+        let s = y * stride;
+        let d = y * width * 4;
+        for (let x = 0; x < width; x++) {
+            out[d] = src[s + 2];     // R
+            out[d + 1] = src[s + 1]; // G
+            out[d + 2] = src[s];     // B
+            out[d + 3] = 255;        // A
+            s += 4; d += 4;
+        }
+    }
+}
+
+// UYVY 4:2:2 (DeckLink 8-bit YUV) → RGBA (BT.601 limited range), honouring stride.
+function drawUYVY(frame) {
+    const { width, height, buffer, rowBytes } = frame;
+    const src = new Uint8Array(buffer);
+    const stride = rowBytes || width * 2;
+    ensureRgbaBuffers(width, height);
+    const out = liveRgba;
+    for (let y = 0; y < height; y++) {
+        let s = y * stride;
+        let d = y * width * 4;
+        for (let x = 0; x < width; x += 2) {
+            const u = src[s] - 128;
+            const y0 = src[s + 1] - 16;
+            const v = src[s + 2] - 128;
+            const y1 = src[s + 3] - 16;
+            const uR = 409 * v + 128;
+            const uG = -100 * u - 208 * v + 128;
+            const uB = 516 * u + 128;
+            let c = 298 * y0;
+            out[d] = clampByte((c + uR) >> 8);
+            out[d + 1] = clampByte((c + uG) >> 8);
+            out[d + 2] = clampByte((c + uB) >> 8);
+            out[d + 3] = 255;
+            c = 298 * y1;
+            out[d + 4] = clampByte((c + uR) >> 8);
+            out[d + 5] = clampByte((c + uG) >> 8);
+            out[d + 6] = clampByte((c + uB) >> 8);
+            out[d + 7] = 255;
+            s += 4; d += 8;
+        }
+    }
+}
+
+function drawLivePlaceholder() {
+    if (!liveCtx || !liveCanvas) return;
+    if (liveCanvas.width !== liveCanvas.clientWidth) liveCanvas.width = liveCanvas.clientWidth || 1280;
+    if (liveCanvas.height !== liveCanvas.clientHeight) liveCanvas.height = liveCanvas.clientHeight || 720;
+    const w = liveCanvas.width, h = liveCanvas.height;
+    liveCtx.fillStyle = '#000';
+    liveCtx.fillRect(0, 0, w, h);
+    liveCtx.fillStyle = '#888';
+    liveCtx.textAlign = 'center';
+    liveCtx.font = `${Math.round(h / 24)}px sans-serif`;
+    const kind = liveInfo && liveInfo.kind === 'ndi' ? 'NDI' : 'DeckLink';
+    const label = (liveInfo && liveInfo.label) ? ` — ${liveInfo.label}` : '';
+    let msg;
+    if (liveInfo && liveInfo.available === false) {
+        msg = liveInfo.error
+            ? `${kind} error: ${liveInfo.error}`
+            : `${kind} not available on this device`;
+    } else {
+        msg = `Waiting for ${kind} signal${label}…`;
+    }
+    liveCtx.fillText(msg, w / 2, h / 2);
+}
+
+function liveDrawLoop() {
+    if (!liveActive) return;
+    const frame = latestFrame;
+    if (frame && liveCtx) {
+        if (liveCanvas.width !== frame.width) liveCanvas.width = frame.width;
+        if (liveCanvas.height !== frame.height) liveCanvas.height = frame.height;
+        try {
+            if (frame.format === 'UYVY') drawUYVY(frame);
+            else drawBGRA(frame);
+            liveCtx.putImageData(liveImageData, 0, 0);
+        } catch (err) {
+            console.error('[LIVE] draw failed:', err.message);
+        }
+        latestFrame = null; // draw-latest: drop stale frames
+    } else if (!frame && (!liveInfo || liveInfo.available === false)) {
+        drawLivePlaceholder();
+    }
+    liveRAF = requestAnimationFrame(liveDrawLoop);
+}
+
+function startLiveSource(info) {
+    // Mutual exclusion: a native source replaces getUserMedia capture.
+    if (captureActive) stopCapture();
+    liveInfo = info || {};
+    liveActive = true;
+    latestFrame = null;
+    showLiveCanvas();
+    drawLivePlaceholder();
+    updateDebug(`${(liveInfo.kind || 'live').toUpperCase()}${liveInfo.label ? ' — ' + liveInfo.label : ''}${liveInfo.available === false ? ' (unavailable)' : ''}`);
+    if (liveRAF) cancelAnimationFrame(liveRAF);
+    liveRAF = requestAnimationFrame(liveDrawLoop);
+}
+
+function stopLiveSource() {
+    if (!liveActive) return;
+    liveActive = false;
+    liveInfo = null;
+    latestFrame = null;
+    if (liveRAF) { cancelAnimationFrame(liveRAF); liveRAF = null; }
+    hideLiveCanvas();
+    updateDebug('Live input stopped, resuming playlist');
+}
+
+// Stop every live overlay (getUserMedia capture + native) and ask main to tear
+// down native producers. Used when a playlist takes over the screen.
+function stopAllLiveInputs() {
+    if (captureActive) stopCapture();
+    if (liveActive) stopLiveSource();
+    if (window.playerAPI && window.playerAPI.requestStopLive) window.playerAPI.requestStopLive();
 }
 
 // --- Video wall crop: video loop ---
@@ -388,8 +570,8 @@ if (window.playerAPI) {
         console.log("Received new local playlist.");
         if (!newPlaylistPaths || newPlaylistPaths.length === 0) return;
 
-        // If capture is active, stop it first so playlist takes over
-        if (captureActive) stopCapture();
+        // If any live input is active, stop it first so the playlist takes over
+        stopAllLiveInputs();
 
         // Stop image timer if showing a static image
         hideImage();
@@ -461,6 +643,19 @@ if (window.playerAPI) {
 
     window.playerAPI.onStopCapture(() => {
         stopCapture();
+    });
+
+    // --- Native Live Input (DeckLink / NDI) Listeners ---
+    window.playerAPI.onFramePort((port) => {
+        attachFramePort(port);
+    });
+
+    window.playerAPI.onStartLive((info) => {
+        startLiveSource(info);
+    });
+
+    window.playerAPI.onStopLive(() => {
+        stopLiveSource();
     });
 
     // --- Volume control ---

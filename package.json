@@ -4,11 +4,16 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "build": "electron-builder --win"
+    "build": "electron-builder --win",
+    "rebuild": "electron-rebuild -f -w macadam"
   },
   "build": {
     "appId": "com.antigravity.cmxplayer",
     "productName": "CMX Player",
+    "asarUnpack": [
+      "node_modules/macadam/**",
+      "**/*.node"
+    ],
     "win": {
       "target": "nsis",
       "icon": "app.ico"

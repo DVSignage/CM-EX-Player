@@ -1,10 +1,15 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, MessageChannelMain } = require('electron');
 const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const fs = require('fs');
 const os = require('os');
+
+// Native live-input producers. Each degrades to an unavailable no-op if its
+// addon/runtime is missing, so the rest of the player is unaffected.
+const ndi = require('./ndi');
+const decklink = require('./decklink');
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
@@ -40,6 +45,101 @@ if (fs.existsSync(CONFIG_PATH)) {
 function saveConfig() {
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
 }
+
+// --- NATIVE LIVE-INPUT PIPELINE (DeckLink + NDI) ---
+// Raw frames from the native producers are forwarded to the renderer over a
+// dedicated MessagePort using transferable ArrayBuffers (zero-copy), bypassing
+// the structured-clone cost of ipcRenderer.
+let framePortMain = null;
+
+function setupFramePort() {
+    if (!mainWindow) return;
+    const { port1, port2 } = new MessageChannelMain();
+    framePortMain = port1;
+    mainWindow.webContents.postMessage('frame-port', null, [port2]);
+}
+
+// Called by the native producers for every captured/received frame.
+function sendFrame(frame) {
+    if (!framePortMain || !frame || !frame.data) return;
+    const src = frame.data;
+    // Copy into a standalone ArrayBuffer we own, then transfer it.
+    const ab = src.buffer.slice(src.byteOffset, src.byteOffset + src.byteLength);
+    framePortMain.postMessage({
+        format: frame.format,
+        width: frame.width,
+        height: frame.height,
+        rowBytes: frame.rowBytes || null,
+        buffer: ab,
+    }, [ab]);
+}
+
+function stopAllNativeInputs() {
+    try { decklink.stop(); } catch (_) {}
+    try { ndi.stop(); } catch (_) {}
+}
+
+// Route a show_capture command: DeckLink goes through the native SDK path;
+// everything else uses the existing getUserMedia path in the renderer.
+async function handleShowCapture(data) {
+    const kind = (data.capture_kind || '').toLowerCase();
+    const label = data.capture_device_label || '';
+    const isDeckLink = kind === 'decklink' || /decklink|blackmagic/i.test(label);
+    if (isDeckLink) {
+        await startDeckLink({ deviceIndex: data.capture_device_index, label, displayMode: data.capture_display_mode });
+    } else {
+        stopAllNativeInputs();
+        if (mainWindow) {
+            mainWindow.webContents.send('stop-live');
+            mainWindow.webContents.send('start-capture', {
+                deviceLabel: label,
+                deviceId: data.capture_device_id,
+            });
+        }
+    }
+}
+
+async function startDeckLink(cfg) {
+    try { ndi.stop(); } catch (_) {}
+    if (!mainWindow) return;
+    mainWindow.webContents.send('stop-capture'); // clear any getUserMedia overlay
+    if (!decklink.isAvailable()) {
+        mainWindow.webContents.send('start-live', { kind: 'decklink', available: false, label: cfg.label });
+        return;
+    }
+    mainWindow.webContents.send('start-live', { kind: 'decklink', available: true, label: cfg.label });
+    try {
+        await decklink.start({ deviceIndex: cfg.deviceIndex, displayMode: cfg.displayMode }, sendFrame);
+    } catch (err) {
+        console.error('[DECKLINK] start failed:', err.message);
+        mainWindow.webContents.send('start-live', { kind: 'decklink', available: false, error: err.message, label: cfg.label });
+    }
+}
+
+async function startNdi(cfg) {
+    try { decklink.stop(); } catch (_) {}
+    if (!mainWindow) return;
+    mainWindow.webContents.send('stop-capture');
+    if (!ndi.isAvailable()) {
+        mainWindow.webContents.send('start-live', { kind: 'ndi', available: false, label: cfg.sourceName });
+        return;
+    }
+    mainWindow.webContents.send('start-live', { kind: 'ndi', available: true, label: cfg.sourceName });
+    try {
+        await ndi.start({ sourceName: cfg.sourceName, bandwidth: cfg.bandwidth }, sendFrame);
+    } catch (err) {
+        console.error('[NDI] start failed:', err.message);
+        mainWindow.webContents.send('start-live', { kind: 'ndi', available: false, error: err.message, label: cfg.sourceName });
+    }
+}
+
+function stopLive() {
+    stopAllNativeInputs();
+    if (mainWindow) mainWindow.webContents.send('stop-live');
+}
+
+// Begin background NDI source discovery (cached; never blocks the heartbeat).
+if (ndi.isAvailable()) ndi.startDiscovery();
 
 // --- CMS INTEGRATION LOGIC ---
 
@@ -133,10 +233,16 @@ async function sendHeartbeat() {
             captureDevices = devices || [];
         } catch(e) { captureDevices = []; }
 
+        // Append native DeckLink inputs (getUserMedia can't see them) so the CMS
+        // can offer them as capture sources.
+        const deckLinkDevices = decklink.listSources();
+
         const response = await axios.post(`${config.cms_url}/api/v1/players/${config.player_id}/heartbeat`, {
              status: 'online',
              timestamp: new Date().toISOString(),
-             capture_devices: captureDevices
+             capture_devices: captureDevices,
+             decklink_devices: deckLinkDevices,
+             ndi_sources: ndi.listSources()
         });
 
         if (response.data && response.data.command && response.data.command !== 'none') {
@@ -186,9 +292,14 @@ async function sendHeartbeat() {
                     loadSingleContent(response.data.wall_content_id);
                 }
             } else if (cmd === 'show_capture') {
-                if (mainWindow) mainWindow.webContents.send('start-capture', { deviceLabel: response.data.capture_device_label });
+                handleShowCapture(response.data);
             } else if (cmd === 'hide_capture') {
+                stopLive();
                 if (mainWindow) mainWindow.webContents.send('stop-capture');
+            } else if (cmd === 'show_ndi') {
+                startNdi({ sourceName: response.data.ndi_source_name, bandwidth: response.data.ndi_bandwidth });
+            } else if (cmd === 'hide_ndi') {
+                stopLive();
             } else if (['play', 'pause', 'next', 'previous', 'restart'].includes(cmd)) {
                 if (mainWindow) mainWindow.webContents.send('control-command', cmd);
             } else if (cmd === 'refresh') {
@@ -243,9 +354,14 @@ function handleCMSCommand(data) {
         console.log(`Loading direct content: ${data.content_id}`);
         loadSingleContent(data.content_id);
     } else if (cmd === 'show_capture') {
-        if (mainWindow) mainWindow.webContents.send('start-capture', { deviceLabel: data.capture_device_label });
+        handleShowCapture(data);
     } else if (cmd === 'hide_capture') {
+        stopLive();
         if (mainWindow) mainWindow.webContents.send('stop-capture');
+    } else if (cmd === 'show_ndi') {
+        startNdi({ sourceName: data.ndi_source_name, bandwidth: data.ndi_bandwidth });
+    } else if (cmd === 'hide_ndi') {
+        stopLive();
     } else if (['play', 'pause', 'next', 'previous', 'restart'].includes(cmd)) {
         if (mainWindow) mainWindow.webContents.send('control-command', cmd);
     } else if (cmd === 'set_volume') {
@@ -559,16 +675,30 @@ function createWindow() {
          }
          // Restore persisted volume on every page load (including after refresh command)
          mainWindow.webContents.send('set-volume', { volume: config.volume, muted: config.muted });
+
+         // (Re)establish the native frame transport for this renderer instance.
+         setupFramePort();
     });
 }
 
 app.whenReady().then(() => {
-    require('./api')(() => mainWindow, CACHE_DIR);
+    require('./api')(() => mainWindow, CACHE_DIR, {
+        ndi,
+        decklink,
+        startDeckLink,
+        startNdi,
+        stopLive,
+    });
 
     ipcMain.on('submit-cms-url', (event, url) => {
         config.cms_url = url;
         saveConfig();
         requestEnrollment();
+    });
+
+    // Renderer asks to tear down native inputs (e.g. a new playlist takes over).
+    ipcMain.on('request-stop-live', () => {
+        stopAllNativeInputs();
     });
 
     // Capture card device enumeration — must run in renderer context
